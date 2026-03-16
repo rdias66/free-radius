@@ -3,7 +3,6 @@
 # AAA processing pipeline for auth and accounting.
 # Reference: https://wiki.freeradius.org/config/Sites-and-Modules
 # =============================================================
-
 server default {
 
     listen {
@@ -39,9 +38,18 @@ server default {
         # Loaded only when cache profile is active.
         -cache
 
-        # SQL backend — comment out and use 'files' for local
-        # flat-file testing only.
+        # SQL backend — fetches Cleartext-Password and reply
+        # attributes from PostgreSQL via pgBouncer.
         sql
+
+        # pap MUST appear after sql in authorize.
+        # sql puts the Cleartext-Password into the control list.
+        # pap then inspects the incoming User-Password attribute,
+        # compares it against control:Cleartext-Password, and sets
+        # Auth-Type := PAP so the authenticate section knows what
+        # to do. Without this, Auth-Type is never set and the
+        # if (!control:Auth-Type) block below rejects every request.
+        pap
 
         # files  # flat-file fallback — dev/test only
 
