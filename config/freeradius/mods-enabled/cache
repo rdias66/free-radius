@@ -1,0 +1,43 @@
+# =============================================================
+# mods-enabled/cache — Redis-backed auth result cache
+# Active only when 'cache' profile is running.
+#
+# SECURITY NOTES
+#   TTL controls how long a revoked user can still authenticate.
+#   Redis password is mandatory (REDIS_PASSWORD in .env).
+#   Cache key is User-Name — usernames must be globally unique.
+#   If reply attributes change (e.g. new VLAN), the change
+#   only takes effect after the cached entry expires.
+#
+# Reference: https://wiki.freeradius.org/modules/Rlm_cache
+# =============================================================
+
+cache {
+    driver = "rlm_cache_redis"
+
+    redis {
+        server   = "${redis_host}:${redis_port}"
+        password = "${redis_password}"
+        database = 0
+        pool {
+            start = 1
+            min   = 1
+            max   = 8
+            spare = 1
+        }
+    }
+
+    key = "%{User-Name}"
+    ttl = ${cache_ttl}
+
+    update {
+        &control:Auth-Type        := &control:Auth-Type
+        &reply:Reply-Message      := &reply:Reply-Message
+        &reply:Session-Timeout    := &reply:Session-Timeout
+        &reply:Idle-Timeout       := &reply:Idle-Timeout
+        # Uncomment for dynamic VLAN assignment:
+        # &reply:Tunnel-Type                 := &reply:Tunnel-Type
+        # &reply:Tunnel-Medium-Type          := &reply:Tunnel-Medium-Type
+        # &reply:Tunnel-Private-Group-Id     := &reply:Tunnel-Private-Group-Id
+    }
+}

@@ -1,0 +1,484 @@
+# =============================================================
+# docker-compose.local.yml
+# FreeRADIUS Adaptive Stack — local development
+# Windows (Docker Desktop) · macOS (Docker Desktop) · Linux desktop
+#
+# This is a complete, self-contained compose file.
+# It is NOT an override — run it directly:
+#
+#   docker compose -f docker-compose.local.yml up -d
+#
+# Or copy it so plain "docker compose" picks it up automatically:
+#   Windows CMD:   copy docker-compose.local.yml docker-compose.override.yml
+#   PowerShell:    Copy-Item docker-compose.local.yml docker-compose.override.yml
+#   bash / zsh:    cp docker-compose.local.yml docker-compose.override.yml
+#   Then:          docker compose up -d
+#
+# ─── What is different from docker-compose.yml (production) ───────
+#
+#   1. Port bindings — mode: host removed
+#      Production uses mode: host, a Linux kernel feature that bypasses
+#      the Docker bridge. Docker Desktop on Windows and macOS does not
+#      support it and will refuse to start. This file uses standard
+#      bridge bindings ("1812:1812/udp") that work on all platforms.
+#
+#   2. No deploy.replicas
+#      The deploy: block is Swarm-mode syntax. Docker Desktop's
+#      non-Swarm Compose silently ignores it, so RADIUS_REPLICAS
+#      never takes effect locally anyway. Removed to avoid confusion.
+#      Local dev always runs one FreeRADIUS container.
+#
+#   3. Relaxed secret requirements
+#      Production uses :? syntax that aborts if a variable is unset.
+#      Here it falls back to safe local-only defaults so you can start
+#      immediately without generating secrets. Change them before
+#      testing against anything that touches real user data.
+#
+#   4. Postgres exposed on localhost:5432
+#      Production deliberately hides Postgres behind pgBouncer with
+#      no host port. Locally, exposing 5432 makes it easy to connect
+#      with psql, DBeaver, DataGrip, or the load generator's --seed-dsn.
+#
+#   5. Replica exposed on localhost:5433
+#      When the ha profile is active, the replica is also reachable
+#      directly so you can observe replication lag, run queries, etc.
+#
+#   6. Smaller resource footprint
+#      shared_buffers, pool sizes, and worker counts are tuned down
+#      for a laptop rather than a server.
+#
+#   7. Distinct network and volume names
+#      radius_net_local and radius_postgres_data_local — so this stack
+#      can coexist on the same machine as a production stack or a second
+#      local instance without name collisions.
+#
+# ─── Profiles ─────────────────────────────────────────────────────
+#   (none)    FreeRADIUS + PostgreSQL + pgBouncer   always on
+#   cache     + Redis auth result cache             optional
+#   ha        + Postgres read-replica               optional (no HAProxy locally)
+#   testing   + radtest-tool container              recommended for dev
+#
+# Examples:
+#   docker compose -f docker-compose.local.yml up -d
+#   docker compose -f docker-compose.local.yml --profile testing up -d
+#   docker compose -f docker-compose.local.yml --profile cache --profile testing up -d
+#   docker compose -f docker-compose.local.yml --profile cache --profile ha --profile testing up -d
+#
+# ─── Image versions (March 2026) ──────────────────────────────────
+#   freeradius/freeradius-server:3.2.7   current stable (v4 is alpha)
+#   postgres:16-alpine
+#   edoburu/pgbouncer:latest
+#   redis:7.4-alpine
+#   alpine:3.21                          radtest-tool base
+# =============================================================
+
+services:
+  # ─────────────────────────────────────────────────────────────────
+  # FreeRADIUS
+  # ─────────────────────────────────────────────────────────────────
+  freeradius:
+    image: freeradius/freeradius-server:3.2.7
+    container_name: radius-freeradius
+    restart: unless-stopped
+
+    # Wrapper entrypoint fixes file permissions before starting FreeRADIUS.
+    # Required on Windows where Docker Desktop presents bind-mounts as 777
+    # and FreeRADIUS refuses to start with world-writable config files.
+    # On Linux and Mac the chmod calls are harmless — it works everywhere.
+    entrypoint: ["/local-entrypoint.sh"]
+
+    # Standard bridge bindings — work on Windows, macOS, and Linux.
+    ports:
+      - "${RADIUS_AUTH_PORT:-1812}:1812/udp"
+      - "${RADIUS_ACCT_PORT:-1813}:1813/udp"
+
+    volumes:
+      - ./scripts/entrypoint-local.sh:/local-entrypoint.sh:ro
+      - ./config/freeradius/radiusd.conf:/etc/freeradius/radiusd.conf
+      - ./config/freeradius/clients.conf:/etc/freeradius/clients.conf
+      - ./config/freeradius/sites-enabled/default:/etc/freeradius/sites-enabled/default
+      - ./config/freeradius/mods-enabled/sql:/etc/freeradius/mods-enabled/sql
+      - ./config/freeradius/mods-enabled/auth_modules:/etc/freeradius/mods-enabled/auth_modules
+      - ./config/freeradius/sites-enabled/inner-tunnel:/etc/freeradius/sites-enabled/inner-tunnel
+
+    environment:
+      TZ: ${TZ:-UTC}
+      # Set DEBUG=true in .env (or inline) to run radiusd -X.
+      # This prints the full AAA pipeline trace to stdout — very noisy,
+      # but the only way to see exactly why a packet was rejected.
+      DEBUG: ${DEBUG:-false}
+
+      # Database — routed through pgBouncer on the internal network.
+      # FreeRADIUS never talks to Postgres directly.
+      DB_HOST: pgbouncer
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-radius}
+      DB_USER: ${POSTGRES_USER:-radius}
+      DB_PASS: ${POSTGRES_PASSWORD:-localpass}
+
+      # Redis — only consumed when the cache profile is active.
+      # FreeRADIUS loads rlm_cache with these values at startup.
+      REDIS_HOST: redis
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-localredis}
+      RADIUS_CACHE_TTL: ${RADIUS_CACHE_TTL:-300}
+
+      # Thread pool — 4 workers is plenty for local testing.
+      # Production uses RADIUS_WORKERS from .env (typically 8–16).
+      RADIUS_WORKERS: ${RADIUS_WORKERS:-4}
+
+      # Shared secret — must match clients.conf and any radtest/NAS call.
+      RADIUS_SECRET: ${RADIUS_SECRET:-localtesting}
+
+      # Healthcheck user password — must match the radcheck row seeded
+      # by config/postgres/init.sql. Default there is CHANGE_ME_health_secret.
+      # If you change this env var, wipe the postgres volume so init.sql reruns:
+      #   docker compose -f docker-compose.local.yml down -v && up -d
+      RADIUS_HEALTH_SECRET: ${RADIUS_HEALTH_SECRET:-CHANGE_ME_health_secret}
+
+    # No command override — the image entrypoint handles startup.
+    # To enable debug mode, set DEBUG=true in .env, which is read
+    # by the healthcheck and can be used to restart with: freeradius -X
+    # Or exec in directly: docker compose -f docker-compose.local.yml exec freeradius freeradius -X
+
+    networks:
+      - radius_net
+
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        - CMD
+        - radtest
+        - healthcheck
+        - ${RADIUS_HEALTH_SECRET:-CHANGE_ME_health_secret}
+        - "127.0.0.1"
+        - "0"
+        - ${RADIUS_HEALTH_SECRET:-CHANGE_ME_health_secret}
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ─────────────────────────────────────────────────────────────────
+  # PostgreSQL primary
+  #
+  # Exposed on localhost:5432 so you can connect directly with psql,
+  # DBeaver, DataGrip, TablePlus, or the load generator's --seed-dsn.
+  # Production does NOT expose this port.
+  #
+  # First-start behaviour:
+  #   Docker runs every file in docker-entrypoint-initdb.d/ on first
+  #   volume initialisation. config/postgres/init.sql creates all tables
+  #   and seeds the healthcheck user and a testuser/testpass test account.
+  #   If you change init.sql, you must wipe the volume to re-run it:
+  #     docker compose -f docker-compose.local.yml down -v
+  # ─────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: radius-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-radius}
+      POSTGRES_USER: ${POSTGRES_USER:-radius}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localpass}
+      PGDATA: /var/lib/postgresql/data/pgdata
+      POSTGRES_HOST_AUTH_METHOD: scram-sha-256
+      # Passed to seed.sh so the healthcheck user gets the right password
+      RADIUS_HEALTH_SECRET: ${RADIUS_HEALTH_SECRET:-CHANGE_ME_health_secret}
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./config/postgres/seed.sh:/docker-entrypoint-initdb.d/02-seed.sh:ro
+
+    ports:
+      - "${POSTGRES_LOCAL_PORT:-5432}:5432"
+
+    networks:
+      - radius_net
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-radius} -d ${POSTGRES_DB:-radius}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    # Tuned down for a laptop. Production values are in .env.
+    command: >
+      postgres
+        -c max_connections=${PG_MAX_CONNECTIONS:-50}
+        -c shared_buffers=${PG_SHARED_BUFFERS:-128MB}
+        -c work_mem=${PG_WORK_MEM:-4MB}
+        -c effective_cache_size=${PG_EFFECTIVE_CACHE:-512MB}
+        -c wal_level=replica
+        -c max_wal_senders=3
+        -c wal_keep_size=64
+        -c log_connections=on
+        -c log_disconnections=on
+        -c log_min_duration_statement=500
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "3"
+
+  # ─────────────────────────────────────────────────────────────────
+  # pgBouncer — connection pooler
+  #
+  # Sits between FreeRADIUS workers and Postgres. Not exposed on a
+  # host port — accessed only by FreeRADIUS on the internal network.
+  #
+  # Pool sizing for local dev:
+  #   max_client_conn = RADIUS_WORKERS (4) + a few spare = 20
+  #   pool_size = 5 real Postgres connections is plenty locally.
+  #   Production values are significantly larger — see .env.example.
+  #
+  # IMPORTANT: pool_mode must stay "transaction". session mode would
+  # hold a connection for the entire worker lifetime and defeat the
+  # purpose of the pooler.
+  # ─────────────────────────────────────────────────────────────────
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: radius-pgbouncer
+    restart: unless-stopped
+
+    environment:
+      # edoburu/pgbouncer env var names (different from the old bitnami image)
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-radius}
+      DB_USER: ${POSTGRES_USER:-radius}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:-localpass}
+      POOL_MODE: ${PGBOUNCER_POOL_MODE:-transaction}
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-20}
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-5}
+      MIN_POOL_SIZE: ${PGBOUNCER_MIN_POOL_SIZE:-1}
+      RESERVE_POOL_SIZE: ${PGBOUNCER_RESERVE_POOL_SIZE:-2}
+      SERVER_IDLE_TIMEOUT: 600
+      CLIENT_IDLE_TIMEOUT: 0
+      AUTH_TYPE: scram-sha-256
+
+    networks:
+      - radius_net
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h localhost -p 5432 -U ${POSTGRES_USER:-radius}",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ─────────────────────────────────────────────────────────────────
+  # Redis — auth result cache (profile: cache)
+  #
+  # Activate:
+  #   docker compose -f docker-compose.local.yml --profile cache up -d
+  #
+  # No disk persistence configured (--save "" --appendonly no).
+  # A Redis restart clears the cache — FreeRADIUS falls back to
+  # Postgres automatically. This is the correct local behaviour.
+  #
+  # The REDIS_PASSWORD default matches the FreeRADIUS env above.
+  # If you change one, change both.
+  # ─────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.4-alpine
+    container_name: radius-redis
+    profiles: [cache]
+    restart: unless-stopped
+
+    command: >
+      redis-server
+        --requirepass ${REDIS_PASSWORD:-localredis}
+        --maxmemory ${REDIS_MAXMEMORY:-64mb}
+        --maxmemory-policy allkeys-lru
+        --save ""
+        --appendonly no
+        --protected-mode yes
+
+    networks:
+      - radius_net
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-localredis}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # ─────────────────────────────────────────────────────────────────
+  # PostgreSQL read-replica (profile: ha)
+  #
+  # Activate:
+  #   docker compose -f docker-compose.local.yml --profile ha up -d
+  #
+  # Streams WAL from the primary. Locally useful for testing replication
+  # behaviour and querying the replica directly.
+  #
+  # HAProxy is intentionally omitted from the local file. With a single
+  # FreeRADIUS container there is nothing to load-balance, and HAProxy
+  # requires port 1812/1813 ownership which conflicts with FreeRADIUS
+  # publishing those ports directly.
+  #
+  # The replica is exposed on localhost:5433 so you can query it:
+  #   psql -h localhost -p 5433 -U radius radius
+  #   SELECT now() - pg_last_xact_replay_timestamp() AS lag;
+  #
+  # First-run note: replica-init.sh calls pg_basebackup against the
+  # primary. The primary must be healthy before the replica starts.
+  # depends_on handles this.
+  # ─────────────────────────────────────────────────────────────────
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: radius-postgres-replica
+    profiles: [ha]
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-radius}
+      POSTGRES_USER: ${POSTGRES_USER:-radius}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-localpass}
+      # PGPASSWORD is used by pg_basebackup inside replica-init.sh.
+      PGPASSWORD: ${POSTGRES_PASSWORD:-localpass}
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./config/postgres/replica-init.sh:/docker-entrypoint-initdb.d/00-replica.sh:ro
+
+    ports:
+      # Separate port so primary and replica can both be open locally.
+      - "${POSTGRES_REPLICA_LOCAL_PORT:-5433}:5432"
+
+    networks:
+      - radius_net
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-radius}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  # ─────────────────────────────────────────────────────────────────
+  # radtest-tool — testing container (profile: testing)
+  #
+  # Activate:
+  #   docker compose -f docker-compose.local.yml --profile testing up -d
+  #
+  # Provides: radtest, radclient, curl, jq, bc
+  # Mounts:   scripts/tests/ at /tests
+  #
+  # Usage:
+  #   docker compose -f docker-compose.local.yml exec radtest-tool sh
+  #   radtest testuser testpass freeradius 0 $RADIUS_SECRET
+  #
+  # The container is inside radius_net and reaches FreeRADIUS by
+  # container name ("freeradius"), not by host IP. This is intentional
+  # — it tests exactly the same path production NAS devices use.
+  # ─────────────────────────────────────────────────────────────────
+  radtest-tool:
+    image: alpine:3.21
+    container_name: radtest-tool
+    profiles: [testing]
+
+    entrypoint: >
+      sh -c '
+        apk add --no-cache freeradius-utils curl jq bc 2>/dev/null;
+        echo "";
+        echo "  radtest-tool ready";
+        echo "  radtest testuser testpass freeradius 0 $$RADIUS_SECRET";
+        echo "  sh /tests/smoke.sh";
+        echo "";
+        sleep infinity
+      '
+
+    environment:
+      RADIUS_HOST: ${RADIUS_TEST_HOST:-freeradius}
+      RADIUS_AUTH_PORT: ${RADIUS_AUTH_PORT:-1812}
+      RADIUS_ACCT_PORT: ${RADIUS_ACCT_PORT:-1813}
+      RADIUS_SECRET: ${RADIUS_SECRET:-localtesting}
+
+    volumes:
+      - ./scripts/tests:/tests:ro
+
+    networks:
+      - radius_net
+
+    depends_on:
+      freeradius:
+        condition: service_healthy
+
+# ─────────────────────────────────────────────────────────────────
+# Networks
+#
+# Uses a distinct name (radius_net_local) so this stack can coexist
+# on the same machine as a production stack or a second local instance
+# without conflicting on the network name.
+#
+# Subnet 172.29.0.0/16 is used instead of production's 172.28.0.0/16
+# for the same reason.
+# ─────────────────────────────────────────────────────────────────
+networks:
+  radius_net:
+    name: radius_net_local
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${RADIUS_NET_SUBNET:-172.29.0.0/16}
+
+# ─────────────────────────────────────────────────────────────────
+# Volumes
+#
+# Distinct names from production (_local suffix) so local and
+# production data never share or overwrite each other.
+# ─────────────────────────────────────────────────────────────────
+volumes:
+  postgres_data:
+    name: radius_postgres_data_local
+  postgres_replica_data:
+    name: radius_postgres_replica_data_local

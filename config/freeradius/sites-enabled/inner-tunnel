@@ -1,0 +1,41 @@
+# sites-enabled/inner-tunnel
+# Required by EAP/PEAP and EAP/TTLS for the inner authentication tunnel.
+# This overrides the image default which incorrectly defines "server default"
+# causing a duplicate virtual server error.
+
+server inner-tunnel {
+
+    listen {
+        type = auth
+        ipaddr = 127.0.0.1
+        port = 18120
+    }
+
+    authorize {
+        preprocess
+        eap { ok = return }
+        files
+        sql
+        pap
+    }
+
+    authenticate {
+        Auth-Type PAP {
+            pap
+        }
+        Auth-Type CHAP {
+            chap
+        }
+        Auth-Type MS-CHAP {
+            mschap
+        }
+        eap
+    }
+
+    post-auth {
+        sql
+        Post-Auth-Type REJECT {
+            attr_filter.access_reject
+        }
+    }
+}

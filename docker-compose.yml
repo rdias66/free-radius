@@ -1,0 +1,384 @@
+# =============================================================
+# FreeRADIUS Adaptive Stack — docker-compose.yml
+# Tier B/C hybrid, Tier D-ready (March 2026)
+#
+# PROFILES
+#   (none)   Base: FreeRADIUS + PostgreSQL + pgBouncer
+#   cache    Adds Redis + rlm_cache (auth result caching)
+#   ha       Adds Postgres read-replica + HAProxy (multi-replica LB)
+#   testing  Adds radtest-tool container
+#
+# USAGE
+#   Tier B  (1 replica, no extras):
+#     docker compose up -d
+#
+#   Tier B+ (1 replica + cache):
+#     docker compose --profile cache up -d
+#
+#   Tier C  (multi-replica + cache + HA):
+#     docker compose --profile cache --profile ha up -d
+#
+#   Any tier + testing:
+#     docker compose --profile testing up -d
+#     docker compose --profile cache --profile ha --profile testing up -d
+#
+# SECURITY NOTES
+#   - Copy .env.example to .env. Never commit .env to git.
+#   - All CHANGE_ME values must be replaced before any deployment.
+#   - Internal services (postgres, redis, pgbouncer) are not
+#     exposed on host ports — radius_net is an isolated bridge.
+#   - FreeRADIUS config is mounted read-only (:ro).
+#   - When ha profile is active, HAProxy owns 1812/1813 on the
+#     host. FreeRADIUS ports are removed via the ha override file.
+#
+# REFERENCES
+#   FreeRADIUS 3.2.x: https://github.com/FreeRADIUS/freeradius-server/tree/v3.2.x
+#   Compose spec:     https://docs.docker.com/compose/compose-file/
+# =============================================================
+
+services:
+  # -----------------------------------------------------------
+  # FreeRADIUS
+  # Image: freeradius/freeradius-server:3.2.7 (current stable)
+  # v4.0 is alpha — not production-ready as of March 2026.
+  # -----------------------------------------------------------
+  freeradius:
+    image: freeradius/freeradius-server:3.2.7
+    restart: unless-stopped
+    deploy:
+      replicas: ${RADIUS_REPLICAS:-1}
+      # Scale with: RADIUS_REPLICAS=4 docker compose up -d
+      # Requires ha profile when replicas > 1.
+
+    # SECURITY: When ha profile is active these ports are owned
+    # by HAProxy instead. Use docker-compose.ha-override.yml to
+    # suppress direct port publishing on the ha profile.
+    ports:
+      - target: 1812
+        published: ${RADIUS_AUTH_PORT:-1812}
+        protocol: udp
+        mode: host
+      - target: 1813
+        published: ${RADIUS_ACCT_PORT:-1813}
+        protocol: udp
+        mode: host
+
+    volumes:
+      # Read-only: config changes require a container restart.
+      # Never exec into a running container to edit config.
+      - ./config/freeradius:/etc/raddb:ro
+
+    environment:
+      TZ: ${TZ:-UTC}
+      DEBUG: ${DEBUG:-false}
+      DB_HOST: pgbouncer
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-radius}
+      DB_USER: ${POSTGRES_USER:-radius}
+      DB_PASS: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      REDIS_HOST: redis
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:-""}
+      RADIUS_CACHE_TTL: ${RADIUS_CACHE_TTL:-300}
+      RADIUS_WORKERS: ${RADIUS_WORKERS:-8}
+      RADIUS_SECRET: ${RADIUS_SECRET:?RADIUS_SECRET must be set in .env}
+      RADIUS_HEALTH_SECRET: ${RADIUS_HEALTH_SECRET:?RADIUS_HEALTH_SECRET must be set in .env}
+
+    networks:
+      - radius_net
+
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        - CMD
+        - radtest
+        - healthcheck
+        - ${RADIUS_HEALTH_SECRET}
+        - "127.0.0.1"
+        - "0"
+        - ${RADIUS_HEALTH_SECRET}
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # -----------------------------------------------------------
+  # PostgreSQL primary
+  # Image: postgres:16-alpine (latest stable, March 2026)
+  # SECURITY: Not exposed on host. Internal network only.
+  # -----------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: radius-postgres
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-radius}
+      POSTGRES_USER: ${POSTGRES_USER:-radius}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./config/postgres/pg_hba.conf:/etc/postgresql/pg_hba.conf:ro
+
+    # SECURITY: No ports block. Postgres is never reachable from
+    # the host — all access is through pgBouncer on radius_net.
+    networks:
+      - radius_net
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-radius} -d ${POSTGRES_DB:-radius}",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    command: >
+      postgres
+        -c max_connections=${PG_MAX_CONNECTIONS:-100}
+        -c shared_buffers=${PG_SHARED_BUFFERS:-256MB}
+        -c work_mem=${PG_WORK_MEM:-4MB}
+        -c effective_cache_size=${PG_EFFECTIVE_CACHE:-1GB}
+        -c wal_level=replica
+        -c max_wal_senders=3
+        -c wal_keep_size=128
+        -c log_connections=on
+        -c log_disconnections=on
+        -c log_min_duration_statement=1000
+        -c hba_file=/etc/postgresql/pg_hba.conf
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "20m"
+        max-file: "5"
+
+  # -----------------------------------------------------------
+  # pgBouncer — connection pooler
+  # Image: edoburu/pgbouncer:latest (Alpine-based, actively maintained)
+  # Replaces bitnami/pgbouncer which was removed from Docker Hub in
+  # August 2025 when Bitnami discontinued versioned free image tags.
+  # Ref: https://github.com/edoburu/docker-pgbouncer
+  # SECURITY: Not exposed on host. Internal network only.
+  # -----------------------------------------------------------
+  pgbouncer:
+    image: edoburu/pgbouncer:latest
+    container_name: radius-pgbouncer
+    restart: unless-stopped
+
+    environment:
+      # edoburu/pgbouncer env var names (different from bitnami)
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: ${POSTGRES_DB:-radius}
+      DB_USER: ${POSTGRES_USER:-radius}
+      DB_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POOL_MODE: ${PGBOUNCER_POOL_MODE:-transaction}
+      MAX_CLIENT_CONN: ${PGBOUNCER_MAX_CLIENT_CONN:-100}
+      DEFAULT_POOL_SIZE: ${PGBOUNCER_DEFAULT_POOL_SIZE:-15}
+      MIN_POOL_SIZE: ${PGBOUNCER_MIN_POOL_SIZE:-5}
+      RESERVE_POOL_SIZE: ${PGBOUNCER_RESERVE_POOL_SIZE:-5}
+      SERVER_IDLE_TIMEOUT: 600
+      CLIENT_IDLE_TIMEOUT: 0
+      AUTH_TYPE: md5
+
+    networks:
+      - radius_net
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -h localhost -p 5432 -U ${POSTGRES_USER:-radius}",
+        ]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # -----------------------------------------------------------
+  # Redis — auth result cache (profile: cache)
+  # Image: redis:7.4-alpine (current stable, March 2026)
+  # SECURITY: Not exposed on host. Password required.
+  # No persistence — restarts with empty cache; safe by design.
+  # -----------------------------------------------------------
+  redis:
+    image: redis:7.4-alpine
+    container_name: radius-redis
+    profiles: [cache]
+    restart: unless-stopped
+
+    command: >
+      redis-server
+        --requirepass ${REDIS_PASSWORD:?REDIS_PASSWORD must be set when cache profile is active}
+        --maxmemory ${REDIS_MAXMEMORY:-256mb}
+        --maxmemory-policy allkeys-lru
+        --save ""
+        --appendonly no
+        --protected-mode yes
+
+    networks:
+      - radius_net
+
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # -----------------------------------------------------------
+  # PostgreSQL read-replica (profile: ha)
+  # Streams WAL from primary. Handles read-heavy acct queries.
+  # SECURITY: Not exposed on host. scram-sha-256 auth required.
+  # -----------------------------------------------------------
+  postgres-replica:
+    image: postgres:16-alpine
+    container_name: radius-postgres-replica
+    profiles: [ha]
+    restart: unless-stopped
+
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-radius}
+      POSTGRES_USER: ${POSTGRES_USER:-radius}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    volumes:
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./config/postgres/replica-init.sh:/docker-entrypoint-initdb.d/00-replica.sh:ro
+
+    networks:
+      - radius_net
+
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-radius}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # -----------------------------------------------------------
+  # HAProxy — UDP load balancer (profile: ha)
+  # Image: haproxy:3.0-alpine (current stable, March 2026)
+  # SECURITY: Owns 1812/1813 on host when active.
+  # Source-IP hash ensures EAP session affinity across replicas.
+  # IMPORTANT: When ha profile is active, ensure freeradius
+  # does NOT also publish those ports (see usage note above).
+  # -----------------------------------------------------------
+  haproxy:
+    image: haproxy:3.0-alpine
+    container_name: radius-haproxy
+    profiles: [ha]
+    restart: unless-stopped
+
+    ports:
+      - "${RADIUS_AUTH_PORT:-1812}:1812/udp"
+      - "${RADIUS_ACCT_PORT:-1813}:1813/udp"
+
+    volumes:
+      - ./config/haproxy/haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+
+    networks:
+      - radius_net
+
+    depends_on:
+      - freeradius
+
+    healthcheck:
+      test: ["CMD", "haproxy", "-c", "-f", "/usr/local/etc/haproxy/haproxy.cfg"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  # -----------------------------------------------------------
+  # radtest-tool — interactive testing container (profile: testing)
+  # Provides radtest, radclient, and test scripts.
+  # See scripts/tests/ for load and scenario scripts.
+  # -----------------------------------------------------------
+  radtest-tool:
+    image: alpine:3.21
+    container_name: radtest-tool
+    profiles: [testing]
+    entrypoint: >
+      sh -c '
+        apk add --no-cache freeradius-utils curl jq bc 2>/dev/null;
+        echo "radtest-tool ready.";
+        sleep infinity
+      '
+
+    environment:
+      RADIUS_HOST: ${RADIUS_TEST_HOST:-freeradius}
+      RADIUS_AUTH_PORT: ${RADIUS_AUTH_PORT:-1812}
+      RADIUS_ACCT_PORT: ${RADIUS_ACCT_PORT:-1813}
+      RADIUS_SECRET: ${RADIUS_SECRET}
+
+    volumes:
+      - ./scripts/tests:/tests:ro
+
+    networks:
+      - radius_net
+
+    depends_on:
+      freeradius:
+        condition: service_healthy
+
+# -----------------------------------------------------------
+networks:
+  radius_net:
+    name: radius_net
+    driver: bridge
+    ipam:
+      config:
+        - subnet: ${RADIUS_NET_SUBNET:-172.28.0.0/16}
+
+volumes:
+  postgres_data:
+    name: radius_postgres_data
+  postgres_replica_data:
+    name: radius_postgres_replica_data

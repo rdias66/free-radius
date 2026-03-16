@@ -1,0 +1,142 @@
+# =============================================================
+# .github/workflows/deploy.yml — Deploy to VM via SSH + rsync
+#
+# REQUIRED SECRETS (set in GitHub repo Settings > Secrets):
+#   SSH_PRIVATE_KEY      — deploy key (no passphrase)
+#   SSH_HOST             — VM IP or hostname
+#   SSH_USER             — deploy user on VM
+#   POSTGRES_PASSWORD    — DB password
+#   REDIS_PASSWORD       — Redis password (cache profile only)
+#   RADIUS_SECRET        — RADIUS shared secret
+#   RADIUS_HEALTH_SECRET — Healthcheck user password
+#
+# REQUIRED VARIABLES (Settings > Variables):
+#   DEPLOY_PATH          — e.g. /home/deploy/radius
+#   ACTIVE_PROFILES      — e.g. "" or "cache" or "cache ha"
+#   RADIUS_REPLICAS      — e.g. 1 or 4
+#   RADIUS_WORKERS       — e.g. 8 or 16
+#
+# SECURITY NOTES
+#   Secrets are never written to disk on the runner.
+#   .env is written on the VM from secrets — not committed.
+#   deploy key has read-only access to this repo.
+#   SSH known_hosts is fingerprint-verified on first deploy.
+# =============================================================
+
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'config/**'
+      - 'docker-compose.yml'
+      - '.env.example'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+    inputs:
+      debug:
+        description: 'Enable FreeRADIUS debug mode'
+        type: boolean
+        default: false
+      profiles:
+        description: 'Override active profiles (e.g. "cache ha")'
+        type: string
+        default: ''
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH agent
+        uses: webfactory/ssh-agent@v0.9.1
+        with:
+          ssh-private-key: ${{ secrets.SSH_PRIVATE_KEY }}
+
+      - name: Add known host
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -H "${{ secrets.SSH_HOST }}" >> ~/.ssh/known_hosts
+
+      - name: Sync project files
+        run: |
+          rsync -avz --delete \
+            --exclude '.env' \
+            --exclude '.git' \
+            --exclude 'scripts/tests' \
+            ./ "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${{ vars.DEPLOY_PATH }}/"
+
+      - name: Write .env on VM
+        env:
+          PROFILES: ${{ inputs.profiles || vars.ACTIVE_PROFILES }}
+          DEBUG_MODE: ${{ inputs.debug || 'false' }}
+        run: |
+          ssh "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" bash -s <<'ENDSSH'
+          cat > "${{ vars.DEPLOY_PATH }}/.env" <<EOF
+          TZ=UTC
+          DEBUG=$DEBUG_MODE
+          RADIUS_REPLICAS=${{ vars.RADIUS_REPLICAS }}
+          RADIUS_WORKERS=${{ vars.RADIUS_WORKERS }}
+          POSTGRES_DB=radius
+          POSTGRES_USER=radius
+          POSTGRES_PASSWORD=${{ secrets.POSTGRES_PASSWORD }}
+          REDIS_PASSWORD=${{ secrets.REDIS_PASSWORD }}
+          RADIUS_SECRET=${{ secrets.RADIUS_SECRET }}
+          RADIUS_HEALTH_SECRET=${{ secrets.RADIUS_HEALTH_SECRET }}
+          PG_MAX_CONNECTIONS=100
+          PG_SHARED_BUFFERS=256MB
+          PG_WORK_MEM=4MB
+          PG_EFFECTIVE_CACHE=1GB
+          PGBOUNCER_POOL_MODE=transaction
+          PGBOUNCER_MAX_CLIENT_CONN=100
+          PGBOUNCER_DEFAULT_POOL_SIZE=15
+          PGBOUNCER_MIN_POOL_SIZE=5
+          PGBOUNCER_RESERVE_POOL_SIZE=5
+          REDIS_MAXMEMORY=256mb
+          RADIUS_CACHE_TTL=300
+          RADIUS_NET_SUBNET=172.28.0.0/16
+          EOF
+          ENDSSH
+
+      - name: Deploy
+        env:
+          PROFILES: ${{ inputs.profiles || vars.ACTIVE_PROFILES }}
+        run: |
+          ssh "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" bash -s <<ENDSSH
+          set -e
+          cd "${{ vars.DEPLOY_PATH }}"
+
+          PROFILE_FLAGS=""
+          for p in $PROFILES; do
+            PROFILE_FLAGS="$$PROFILE_FLAGS --profile $$p"
+          done
+
+          docker compose $$PROFILE_FLAGS pull
+          docker compose $$PROFILE_FLAGS up -d --remove-orphans
+          ENDSSH
+
+      - name: Wait for health
+        run: |
+          ssh "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" bash -s <<'ENDSSH'
+          set -e
+          cd "${{ vars.DEPLOY_PATH }}"
+          echo "Waiting for FreeRADIUS to pass healthcheck..."
+          for i in $(seq 1 12); do
+            STATUS=$(docker compose ps --format json freeradius 2>/dev/null | \
+                     python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('Health',''))" 2>/dev/null || echo "unknown")
+            echo "  Attempt $i: $STATUS"
+            if [ "$STATUS" = "healthy" ]; then
+              echo "Healthy."
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "ERROR: FreeRADIUS did not become healthy within 60s"
+          docker compose logs --tail=50 freeradius
+          exit 1
+          ENDSSH

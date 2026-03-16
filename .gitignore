@@ -1,0 +1,34 @@
+# =============================================================
+# .gitignore — FreeRADIUS Adaptive Stack
+# =============================================================
+
+# ---- Environment files --------------------------------------
+# .env is NEVER committed. It contains all deployment secrets.
+# .env.local contains local dev defaults — commit it (values are
+# intentionally weak and only valid on localhost).
+# .env.production, .env.staging etc. are never committed.
+.env
+.env.production
+.env.staging
+.env.*.local
+
+# ---- TLS / certificates -------------------------------------
+*.key
+*.pem
+*.crt
+*.p12
+*.pfx
+
+# ---- Docker volumes (if accidentally created in project dir) -
+postgres_data/
+postgres_replica_data/
+
+# ---- OS files -----------------------------------------------
+.DS_Store
+Thumbs.db
+
+# ---- Editor files -------------------------------------------
+.idea/
+.vscode/
+*.swp
+*.swo

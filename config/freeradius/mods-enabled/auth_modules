@@ -1,0 +1,11 @@
+# mods-enabled/auth_modules
+#
+# pap, chap, mschap, preprocess, attr_filter, and detail are already
+# enabled by the image's default mods-enabled/ symlinks pointing to
+# mods-available/. Redefining them here causes startup errors because
+# our simplified versions lack internal variable references.
+#
+# This file is intentionally minimal. The image defaults handle all
+# standard auth modules. Add overrides here only if you need to change
+# a specific module's settings, and copy the full definition from
+# /etc/raddb/mods-available/ inside the container as your starting point.

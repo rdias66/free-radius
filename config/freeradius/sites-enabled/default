@@ -1,0 +1,100 @@
+# =============================================================
+# sites-enabled/default — Primary virtual server
+# AAA processing pipeline for auth and accounting.
+# Reference: https://wiki.freeradius.org/config/Sites-and-Modules
+# =============================================================
+
+server default {
+
+    listen {
+        type   = auth
+        ipaddr = *
+        port   = 1812
+        limit {
+            max_connections = 64
+            lifetime        = 0
+            idle_timeout    = 30
+        }
+    }
+
+    listen {
+        type   = acct
+        ipaddr = *
+        port   = 1813
+    }
+
+    # =========================================================
+    # Authorize
+    # Runs on every Access-Request. Determines Auth-Type.
+    # SECURITY: The '-' prefix on cache/sql makes the module
+    # non-fatal if not loaded — safe for optional profiles.
+    # =========================================================
+    authorize {
+        preprocess
+        eap
+
+        # Cache lookup — returns cached result within TTL.
+        # SECURITY: Revoked users remain authorized until
+        # their cache entry expires (RADIUS_CACHE_TTL seconds).
+        # Loaded only when cache profile is active.
+        -cache
+
+        # SQL backend — comment out and use 'files' for local
+        # flat-file testing only.
+        sql
+
+        # files  # flat-file fallback — dev/test only
+
+        if (!control:Auth-Type) {
+            update control {
+                Auth-Type := Reject
+            }
+        }
+    }
+
+    # =========================================================
+    # Authenticate
+    # =========================================================
+    authenticate {
+        Auth-Type PAP {
+            pap
+        }
+        Auth-Type CHAP {
+            chap
+        }
+        Auth-Type MS-CHAP {
+            mschap
+        }
+        # EAP — required by the eap module even if no clients use EAP.
+        # The module checks for this section at startup and fails without it.
+        Auth-Type EAP {
+            eap
+        }
+    }
+
+    # =========================================================
+    # Post-Auth
+    # =========================================================
+    post-auth {
+        # Store successful auth result in cache.
+        # Loaded only when cache profile is active.
+        -cache_store
+
+        sql
+
+        Post-Auth-Type REJECT {
+            attr_filter.access_reject
+            # SECURITY: Log rejects to radpostauth for monitoring.
+            # High rejection rates = possible brute-force in progress.
+            # sql
+        }
+    }
+
+    # =========================================================
+    # Accounting
+    # =========================================================
+    accounting {
+        sql
+        detail
+    }
+}
