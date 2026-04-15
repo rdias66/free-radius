@@ -42,6 +42,14 @@ server default {
         # attributes from PostgreSQL via pgBouncer.
         sql
 
+        # Tell sqlippool which pool to allocate from.
+        # The sqlippool queries use %{control:Pool-Name} to find rows
+        # in radippool where pool_name = 'local'. This must be set
+        # before post-auth runs.
+        update control {
+            Pool-Name := "local"
+        }
+
         # pap MUST appear after sql in authorize.
         # sql puts the Cleartext-Password into the control list.
         # pap then inspects the incoming User-Password attribute,
@@ -90,12 +98,33 @@ server default {
 
         sql
 
+        # Allocate an IP from radippool and write it into
+        # Framed-IP-Address in the Access-Accept reply.
+        # The loadgen reads this attribute and echoes it in
+        # every accounting packet so rlm_sqlippool can release
+        # the address when the Acct-Stop arrives.
+        sqlippool
+
         Post-Auth-Type REJECT {
             attr_filter.access_reject
-            # SECURITY: Log rejects to radpostauth for monitoring.
-            # High rejection rates = possible brute-force in progress.
-            # sql
+            # Write reject to radpostauth so v_connection_log shows "Login incorrect"
+            # alongside accepts. Also captures duplicate-MAC rejects (Phase 13).
+            # High rejection rates in this table = possible brute-force in progress.
+            sql
         }
+    }
+
+    # =========================================================
+    # Pre-Accounting
+    # Runs before the accounting section. acct_unique computes
+    # Acct-Unique-Session-Id from User-Name, Acct-Session-ID,
+    # NAS-IP-Address, and NAS-Port — used as the primary key in
+    # the radacct SQL queries. Without it, acctuniqueid is empty
+    # and all accounting INSERTs after the first fail the UNIQUE
+    # constraint on radacct.acctuniqueid.
+    # =========================================================
+    preacct {
+        acct_unique
     }
 
     # =========================================================
@@ -103,6 +132,15 @@ server default {
     # =========================================================
     accounting {
         sql
+
+        # Handle IP pool lifecycle:
+        #   Acct-Start   → marks the IP as in-use (updates nasipaddress,
+        #                   callingstationid, username, expiry_time)
+        #   Acct-Interim → refreshes expiry_time to prevent premature release
+        #   Acct-Stop    → clears the lease; logs:
+        #                   "Released IP 10.100.0.x (did cli <MAC> user <user>)"
+        sqlippool
+
         detail
     }
 }

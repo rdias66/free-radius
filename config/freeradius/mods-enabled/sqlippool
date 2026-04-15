@@ -1,0 +1,51 @@
+# =============================================================
+# mods-enabled/sqlippool — IP pool management via rlm_sqlippool
+#
+# This module allocates Framed-IP-Address from the radippool
+# table in post-auth and releases it when an Acct-Stop arrives
+# in the accounting section.
+#
+# FreeRADIUS 3.2.7 rlm_sqlippool logs "Allocated IP X.X.X.X" on
+# allocation. The stop_clear path runs silently (no release log line —
+# the module does not log this in 3.x). Verify via radippool table:
+#   SELECT COUNT(*) FROM radippool WHERE expiry_time > now();
+#
+# REQUIRES:
+#   - radippool table seeded in PostgreSQL (init.sql + seed-ippool.sh)
+#   - Pool-Name := "local" set in authorize section of sites-enabled/default
+#
+# pool_key = Calling-Station-Id (MAC address)
+#   The default pool_key is NAS-Port, which the load generator does
+#   not include in Accounting-Request packets (only in Access-Request).
+#   Calling-Station-Id is sent in both auth and accounting packets,
+#   making it a reliable key for matching allocate → start → stop.
+# =============================================================
+sqlippool {
+    sql_module_instance = "sql"
+
+    # MUST override the image default (mysql). FreeRADIUS uses this to
+    # build the path: ${modconfdir}/sql/ippool/postgresql/queries.conf
+    dialect = "postgresql"
+
+    # Name of the RADIUS control attribute that holds the pool name.
+    # The authorize section sets control:Pool-Name := "local" so the
+    # queries can find rows WHERE pool_name = 'local'.
+    pool_name = "Pool-Name"
+
+    ippool_table = "radippool"
+
+    # How long (seconds) an allocated IP stays reserved.
+    lease_duration = 3600
+
+    # Key used to identify a session for sticky re-allocation and release.
+    # Must be present in both Access-Request and Accounting-Request.
+    # NAS-Port (the image default) is NOT sent in accounting packets by
+    # the load generator, so Calling-Station-Id is used instead.
+    pool_key = "%{Calling-Station-Id}"
+
+    # Attribute to write the assigned IP into (reply on post-auth;
+    # request on accounting, so stop_clear can find the address).
+    attribute_name = Framed-IP-Address
+
+    $INCLUDE ${modconfdir}/sql/ippool/postgresql/queries.conf
+}

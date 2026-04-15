@@ -98,6 +98,7 @@ services:
       - ./config/freeradius/sites-enabled/default:/etc/freeradius/sites-enabled/default
       - ./config/freeradius/mods-enabled/sql:/etc/freeradius/mods-enabled/sql
       - ./config/freeradius/mods-enabled/auth_modules:/etc/freeradius/mods-enabled/auth_modules
+      - ./config/freeradius/mods-enabled/sqlippool:/etc/freeradius/mods-enabled/sqlippool
       - ./config/freeradius/sites-enabled/inner-tunnel:/etc/freeradius/sites-enabled/inner-tunnel
 
     environment:
@@ -194,11 +195,18 @@ services:
       POSTGRES_HOST_AUTH_METHOD: scram-sha-256
       # Passed to seed.sh so the healthcheck user gets the right password
       RADIUS_HEALTH_SECRET: ${RADIUS_HEALTH_SECRET:-CHANGE_ME_health_secret}
+      # IP pool seeding — consumed by 03-seed-ippool.sh on first init.
+      # Set IPPOOL_PRESET=cgnat in .env for RFC 6598 100.64.x.x range.
+      IPPOOL_PRESET: ${IPPOOL_PRESET:-private}
+      IPPOOL_NAME:   ${IPPOOL_NAME:-local}
+      IPPOOL_START:  ${IPPOOL_START:-}
+      IPPOOL_END:    ${IPPOOL_END:-}
 
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./config/postgres/init.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
       - ./config/postgres/seed.sh:/docker-entrypoint-initdb.d/02-seed.sh:ro
+      - ./config/postgres/seed-ippool.sh:/docker-entrypoint-initdb.d/03-seed-ippool.sh:ro
 
     ports:
       - "${POSTGRES_LOCAL_PORT:-5432}:5432"

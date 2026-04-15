@@ -12,10 +12,10 @@ sql {
     radius_db = "${sql_db}"
 
     pool {
-        start        = 1
-        min          = 1
-        max          = 3
-        spare        = 1
+        start        = 5
+        min          = 5
+        max          = 20
+        spare        = 5
         uses         = 0
         retry_delay  = 30
         lifetime     = 0
@@ -40,4 +40,17 @@ sql {
     safe_characters = "@abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789.-_: /"
 
     $INCLUDE ${modconfdir}/${.:name}/main/${dialect}/queries.conf
+
+    # Override postauth_query to also capture Calling-Station-Id (MAC address).
+    # The default query from the image omits this column; we need it so that
+    # v_connection_log can show the subscriber MAC on both accept and reject events.
+    postauth_query = "\
+        INSERT INTO ${postauth_table} \
+            (username, pass, reply, authdate, callingstationid) \
+        VALUES( \
+            '%{SQL-User-Name}', \
+            '%{%{User-Password}:-Chap-Password}', \
+            '%{reply:Packet-Type}', \
+            '%S', \
+            '%{Calling-Station-Id}')"
 }

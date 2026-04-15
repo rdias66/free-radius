@@ -95,7 +95,6 @@ services:
     volumes:
       - ./scripts/entrypoint-local.sh:/local-entrypoint.sh:ro
       - ./config/freeradius/radiusd.conf:/etc/freeradius/radiusd.conf
-      - ./config/freeradius/clients.conf:/etc/freeradius/clients.conf
       - ./config/freeradius/sites-enabled/default:/etc/freeradius/sites-enabled/default
       - ./config/freeradius/mods-enabled/sql:/etc/freeradius/mods-enabled/sql
       - ./config/freeradius/mods-enabled/auth_modules:/etc/freeradius/mods-enabled/auth_modules

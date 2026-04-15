@@ -76,5 +76,10 @@ EOF
 chmod 640 /etc/freeradius/clients.conf
 chown root:freerad /etc/freeradius/clients.conf
 
-echo "[local] handing off to freeradius entrypoint..."
-exec /docker-entrypoint.sh "$@"
+if [ "${DEBUG:-false}" = "true" ]; then
+    echo "[local] DEBUG=true — starting freeradius -X (verbose pipeline trace)"
+    exec freeradius -X
+else
+    echo "[local] handing off to freeradius entrypoint..."
+    exec /docker-entrypoint.sh "$@"
+fi
